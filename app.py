@@ -14,33 +14,35 @@ from flask_limiter.util import get_remote_address
 load_dotenv()
 
 app = Flask(__name__)
+
 limiter = Limiter(
     get_remote_address,
     app=app,
-    default_limits=["200 per day", "50 per hour"],
+    default_limits=[],           # No blanket defaults — limits are set per-route
     storage_uri="memory://"
 )
-# Initialize Groq client
-# It will automatically look for the GROQ_API_KEY in your environment
+
 groq_client = Groq()
 
-# --- DATABASE SETUP ---
+# ---------------------------------------------------------------------------
+# DATABASE
+# ---------------------------------------------------------------------------
 DB_FILE = "audit_log.db"
 
 def init_db():
-    """Initializes the SQLite database for the audit log."""
+    """Creates the audit_log table if it doesn't already exist."""
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
+        conn.execute('''
             CREATE TABLE IF NOT EXISTS audit_log (
-                content_id TEXT PRIMARY KEY,
-                creator_id TEXT,
-                timestamp TEXT,
-                attribution TEXT,
-                confidence REAL,
-                groq_score REAL,
-                ttr_score REAL,
-                status TEXT,
+                content_id       TEXT PRIMARY KEY,
+                creator_id       TEXT,
+                timestamp        TEXT,
+                attribution      TEXT,
+                confidence       REAL,
+                groq_score       REAL,
+                ttr_raw          REAL,   -- raw vocabulary diversity (higher = more diverse)
+                ttr_inverted     REAL,   -- 1 - ttr_raw, used in confidence formula
+                status           TEXT,
                 appeal_reasoning TEXT
             )
         ''')
@@ -48,148 +50,273 @@ def init_db():
 
 init_db()
 
-# --- SIGNAL 1: GROQ LLM ---
+# ---------------------------------------------------------------------------
+# SIGNAL 1 — Groq LLM (semantic / holistic)
+# ---------------------------------------------------------------------------
 def analyze_with_groq(text: str) -> float:
     """
-    Sends the text to Llama-3 via Groq to assess semantic and stylistic coherence.
-    Returns a float between 0.0 (Likely Human) and 1.0 (Likely AI).
+    Asks Llama-3 to assess whether the text reads as human- or AI-generated.
+    Returns a float 0.0 (definitely human) → 1.0 (definitely AI).
+    Falls back to 0.5 on any API error so the system degrades gracefully.
     """
-    prompt = f"""
-    You are an expert stylometric AI detector. Analyze the following text and determine if it reads as human-written or AI-generated.
-    AI text often has perfectly balanced structures, highly predictable transitions, and lacks emotional quirks. 
-    Human text often contains varied pacing, idiosyncrasies, and organic leaps in logic.
-    
-    Return your analysis strictly in JSON format with a single key "ai_probability" and a float value between 0.0 (Definitely Human) and 1.0 (Definitely AI).
-    
-    Text to analyze:
-    "{text}"
-    """
-    
+    prompt = (
+        "You are an expert stylometric AI detector. Analyze the following text and "
+        "decide whether it reads as human-written or AI-generated.\n\n"
+        "AI text tends to have: perfectly balanced sentence structures, predictable "
+        "transitions (e.g. 'Furthermore', 'It is important to note'), and a lack of "
+        "emotional quirks or organic tangents.\n"
+        "Human text tends to have: varied pacing, idiosyncrasies, casual asides, "
+        "and unexpected vocabulary choices.\n\n"
+        "Return ONLY a JSON object with a single key \"ai_probability\" whose value "
+        "is a float between 0.0 (Definitely Human) and 1.0 (Definitely AI).\n\n"
+        f"Text to analyze:\n\"\"\"\n{text}\n\"\"\""
+    )
+
     try:
         response = groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You output JSON only."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": "You output JSON only. No explanation."},
+                {"role": "user",   "content": prompt}
             ],
             model="llama-3.3-70b-versatile",
             response_format={"type": "json_object"},
-            temperature=0.0 # Keep it deterministic
+            temperature=0.0
         )
-        
-        result_json = json.loads(response.choices[0].message.content)
-        # Default to 0.5 if the model returns something unexpected
-        return float(result_json.get("ai_probability", 0.5))
-        
+        result = json.loads(response.choices[0].message.content)
+        score = float(result.get("ai_probability", 0.5))
+        return max(0.0, min(1.0, score))   # clamp to [0, 1]
+
     except Exception as e:
-        print(f"Groq API Error: {e}")
-        return 0.5 
-# --- SIGNAL 2: STYLOMETRICS (TTR) ---
+        print(f"[Groq error] {e}")
+        return 0.5
+
+
+# ---------------------------------------------------------------------------
+# SIGNAL 2 — Stylometrics: Type-Token Ratio (structural / statistical)
+# ---------------------------------------------------------------------------
 def calculate_ttr(text: str) -> float:
     """
-    Calculates the Type-Token Ratio (vocabulary diversity).
-    Returns a float between 0.0 and 1.0. Higher means more vocabulary diversity.
-    """
-    # Remove punctuation and lowercase the text
-    translator = str.maketrans('', '', string.punctuation)
-    clean_text = text.translate(translator).lower()
-    
-    tokens = clean_text.split()
-    
-    if not tokens:
-        return 0.0 # Prevent division by zero on empty strings
-        
-    unique_words = set(tokens)
-    return len(unique_words) / len(tokens)
-# --- ROUTES ---
-@app.route("/submit", methods=["POST"])
-@limiter.limit("5 per minute") # Rate limiting specific to this endpoint
-def submit_content():
-    data = request.get_json()
-    
-    if not data or "text" not in data or "creator_id" not in data:
-        return jsonify({"error": "Missing 'text' or 'creator_id' in request body"}), 400
-        
-    text = data["text"]
-    creator_id = data["creator_id"]
-    content_id = str(uuid.uuid4())
-    timestamp = datetime.now(timezone.utc).isoformat()
-    
-    groq_score = analyze_with_groq(text)
-    ttr_score = calculate_ttr(text)
-    inverted_ttr = 1.0 - ttr_score 
-    
-    final_confidence = (groq_score * 0.70) + (inverted_ttr * 0.30)
-    
-    if final_confidence >= 0.76:
-        attribution = "likely_ai"
-        label = "Likely AI-Generated. Our detection signals indicate with high confidence that this content was primarily generated by artificial intelligence. If you believe this is an error, please submit an appeal."
-    elif final_confidence <= 0.35:
-        attribution = "likely_human"
-        label = "Likely Human. Our detection signals indicate with high confidence that this content is organically written."
-    else:
-        attribution = "uncertain"
-        label = "Unclassified. This content exhibits mixed signals. Our system cannot definitively determine whether it was written by a human or generated by AI."
+    Type-Token Ratio = unique_words / total_words.
+    Higher TTR → richer vocabulary → more likely human.
+    Returns raw TTR (0.0–1.0). The caller inverts it for the confidence formula.
 
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO audit_log (content_id, creator_id, timestamp, attribution, confidence, groq_score, ttr_score, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (content_id, creator_id, timestamp, attribution, final_confidence, groq_score, ttr_score, "classified"))
-        conn.commit()
-        
+    Known limitation: very short texts (<20 tokens) produce unreliable TTR
+    because the ratio is trivially high for any short sequence.
+    """
+    translator = str.maketrans('', '', string.punctuation)
+    tokens = text.translate(translator).lower().split()
+
+    if len(tokens) < 5:
+        return 0.5   # not enough data — return neutral rather than skew score
+
+    return len(set(tokens)) / len(tokens)
+
+
+# ---------------------------------------------------------------------------
+# CONFIDENCE SCORING
+# ---------------------------------------------------------------------------
+def compute_confidence(groq_score: float, ttr_raw: float) -> tuple[float, float]:
+    """
+    Combines the two signal scores into a single calibrated confidence value.
+
+    Formula: confidence = (groq_score × 0.70) + (inverted_ttr × 0.30)
+
+    LLM is weighted heavier because TTR degrades on short or vocabulary-dense
+    texts regardless of authorship. The inverted TTR converts 'diversity'
+    into 'AI-likeness' (low diversity → high AI probability).
+
+    Returns (final_confidence, ttr_inverted).
+    """
+    ttr_inverted = 1.0 - ttr_raw
+    confidence = (groq_score * 0.70) + (ttr_inverted * 0.30)
+    return round(max(0.0, min(1.0, confidence)), 4), round(ttr_inverted, 4)
+
+
+# ---------------------------------------------------------------------------
+# TRANSPARENCY LABEL
+# ---------------------------------------------------------------------------
+def generate_label(confidence: float) -> tuple[str, str]:
+    """
+    Maps a confidence score to an attribution string and plain-language label.
+
+    Thresholds (asymmetric — errs toward human to reduce false positives):
+      0.00 – 0.35  →  likely_human
+      0.36 – 0.75  →  uncertain
+      0.76 – 1.00  →  likely_ai
+    """
+    if confidence <= 0.35:
+        return (
+            "likely_human",
+            (
+                "✅ Likely Human-Written. Our analysis signals indicate with high "
+                "confidence that this content was organically written by a person. "
+                "Vocabulary diversity and semantic style both align with human authorship."
+            )
+        )
+    elif confidence <= 0.75:
+        return (
+            "uncertain",
+            (
+                "⚠️ Uncertain — Mixed Signals. Our system cannot confidently determine "
+                "whether this content was written by a human or generated by AI. "
+                "It shows characteristics of both. No flag has been applied. "
+                "If you are the creator, no action is needed."
+            )
+        )
+    else:
+        return (
+            "likely_ai",
+            (
+                "🤖 Likely AI-Generated. Our detection signals indicate with high "
+                "confidence that this content was primarily generated by artificial "
+                "intelligence. If you believe this classification is incorrect, "
+                "you may submit an appeal below."
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# ROUTES
+# ---------------------------------------------------------------------------
+
+@app.route("/", methods=["GET"])
+def index():
+    """Health check / API index — prevents 404 on root URL."""
     return jsonify({
-        "content_id": content_id,
-        "attribution": attribution,
-        "confidence": round(final_confidence, 2),
-        "label": label
+        "service": "Provenance Guard",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "POST /submit": "Submit content for attribution analysis",
+            "POST /appeal": "Contest a classification decision",
+            "GET  /log":    "View the full audit log"
+        }
     }), 200
+
+
+@app.route("/submit", methods=["POST"])
+@limiter.limit("5 per minute; 50 per day")
+def submit_content():
+    """
+    Accepts a piece of text for attribution analysis.
+    Runs both detection signals, computes confidence, selects label,
+    writes to audit log, and returns a structured response.
+
+    Body: { "text": "...", "creator_id": "..." }
+    """
+    data = request.get_json(silent=True)
+
+    if not data or "text" not in data or "creator_id" not in data:
+        return jsonify({"error": "Request body must include 'text' and 'creator_id'."}), 400
+
+    text       = data["text"].strip()
+    creator_id = data["creator_id"].strip()
+
+    if not text:
+        return jsonify({"error": "'text' cannot be empty."}), 400
+
+    content_id = str(uuid.uuid4())
+    timestamp  = datetime.now(timezone.utc).isoformat()
+
+    # --- Run signals ---
+    groq_score = analyze_with_groq(text)
+    ttr_raw    = calculate_ttr(text)
+
+    # --- Score & label ---
+    confidence, ttr_inverted = compute_confidence(groq_score, ttr_raw)
+    attribution, label       = generate_label(confidence)
+
+    # --- Persist to audit log ---
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute('''
+            INSERT INTO audit_log
+              (content_id, creator_id, timestamp, attribution, confidence,
+               groq_score, ttr_raw, ttr_inverted, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (content_id, creator_id, timestamp, attribution, confidence,
+              groq_score, ttr_raw, ttr_inverted, "classified"))
+        conn.commit()
+
+    return jsonify({
+        "content_id":  content_id,
+        "attribution": attribution,
+        "confidence":  confidence,
+        "label":       label,
+        "signals": {
+            "groq_score":    round(groq_score, 4),
+            "ttr_raw":       round(ttr_raw, 4),
+            "ttr_inverted":  round(ttr_inverted, 4)
+        }
+    }), 200
+
 
 @app.route("/appeal", methods=["POST"])
 def submit_appeal():
-    data = request.get_json()
-    
+    """
+    Allows a creator to contest a classification.
+    Updates status to 'under_review' and logs the creator's reasoning.
+
+    Body: { "content_id": "...", "creator_reasoning": "..." }
+    """
+    data = request.get_json(silent=True)
+
     if not data or "content_id" not in data or "creator_reasoning" not in data:
-        return jsonify({"error": "Missing 'content_id' or 'creator_reasoning'"}), 400
-        
-    content_id = data["content_id"]
-    reasoning = data["creator_reasoning"]
-    
+        return jsonify({"error": "Request body must include 'content_id' and 'creator_reasoning'."}), 400
+
+    content_id = data["content_id"].strip()
+    reasoning  = data["creator_reasoning"].strip()
+
+    if not reasoning:
+        return jsonify({"error": "'creator_reasoning' cannot be empty."}), 400
+
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        
-        # Check if the content exists
-        cursor.execute('SELECT status FROM audit_log WHERE content_id = ?', (content_id,))
-        row = cursor.fetchone()
-        
+        row = conn.execute(
+            'SELECT status FROM audit_log WHERE content_id = ?', (content_id,)
+        ).fetchone()
+
         if not row:
-            return jsonify({"error": "content_id not found"}), 404
-            
-        # Update the database
-        cursor.execute('''
-            UPDATE audit_log 
-            SET status = 'under_review', appeal_reasoning = ? 
+            return jsonify({"error": f"No submission found for content_id '{content_id}'."}), 404
+
+        if row[0] == "under_review":
+            return jsonify({"message": "An appeal for this content is already under review.", "content_id": content_id}), 200
+
+        conn.execute('''
+            UPDATE audit_log
+            SET status = 'under_review', appeal_reasoning = ?
             WHERE content_id = ?
         ''', (reasoning, content_id))
         conn.commit()
-        
+
     return jsonify({
-        "message": "Appeal submitted successfully. Status updated to under_review.",
-        "content_id": content_id
+        "message":    "Appeal submitted successfully. A human reviewer will assess your case.",
+        "content_id": content_id,
+        "status":     "under_review"
     }), 200
+
 
 @app.route("/log", methods=["GET"])
 def get_log():
-    """Returns the entire audit log as JSON."""
+    """Returns all audit log entries, most recent first."""
     with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row # This allows us to fetch rows as dictionaries
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM audit_log ORDER BY timestamp DESC')
-        rows = cursor.fetchall()
-        
-    # Convert SQLite rows to a list of standard dictionaries
-    entries = [dict(row) for row in rows]
-    return jsonify({"entries": entries}), 200
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            'SELECT * FROM audit_log ORDER BY timestamp DESC'
+        ).fetchall()
+
+    return jsonify({"entries": [dict(r) for r in rows]}), 200
+
+
+# ---------------------------------------------------------------------------
+# RATE LIMIT ERROR HANDLER
+# ---------------------------------------------------------------------------
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return jsonify({
+        "error": "Rate limit exceeded.",
+        "detail": str(e.description),
+        "retry_after": "Please wait before submitting again."
+    }), 429
+
 
 if __name__ == "__main__":
     app.run(debug=True)
